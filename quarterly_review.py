@@ -109,11 +109,29 @@ def create_bullet(text: str) -> dict:
     }
 
 
-def format_calendar_blocks(events_by_cal: dict) -> list:
+def get_calendar_display_name(cal_id: str, calendar_names: dict) -> str:
+    """カレンダーの表示名を生成する。
+
+    Args:
+        cal_id (str): カレンダーID。
+        calendar_names (dict): カレンダーIDをキー、カレンダー名を値とする辞書。
+
+    Returns:
+        str: カレンダーの表示名。名前が取得できた場合は「名前 (ID: xxx)」、できない場合は「ID」。
+    """
+    cal_name = calendar_names.get(cal_id, cal_id)
+    if cal_name != cal_id:
+        return f"{cal_name} (ID: {cal_id})"
+    else:
+        return cal_id
+
+
+def format_calendar_blocks(events_by_cal: dict, calendar_names: dict) -> list:
     """カレンダーごとの予定リストブロックを作成します。
 
     Args:
         events_by_cal (dict): カレンダーIDをキー、イベントリストを値とする辞書。
+        calendar_names (dict): カレンダーIDをキー、カレンダー名を値とする辞書。
 
     Returns:
         list: Notionブロックオブジェクトのリスト。
@@ -126,8 +144,8 @@ def format_calendar_blocks(events_by_cal: dict) -> list:
 
     for cal_id, events in events_by_cal.items():
         count = len(events)
-        # カレンダーIDごとの見出しに件数を追加
-        blocks.append(create_heading_3(f"Calendar: {cal_id} ({count}件)"))
+        display_name = get_calendar_display_name(cal_id, calendar_names)
+        blocks.append(create_heading_3(f"Calendar: {display_name}, {count}件"))
         if not events:
             blocks.append(create_bullet("(なし)"))
             continue
@@ -201,12 +219,13 @@ def format_ai_content_blocks(markdown_text: str) -> list:
 # --- Gemini関連処理 ---
 
 
-def format_data_for_ai(tasks: list, events_by_cal: dict) -> str:
+def format_data_for_ai(tasks: list, events_by_cal: dict, calendar_names: dict) -> str:
     """収集したタスクとイベントデータを、AIへのプロンプト用にテキスト整形します。
 
     Args:
         tasks (list): Notionから取得したタスクオブジェクト(辞書)のリスト。
         events_by_cal (dict): カレンダーごとのイベントリスト辞書。
+        calendar_names (dict): カレンダーIDをキー、カレンダー名を値とする辞書。
 
     Returns:
         str: AIへの入力として利用する整形済みテキスト文字列。
@@ -226,7 +245,8 @@ def format_data_for_ai(tasks: list, events_by_cal: dict) -> str:
 
     text += "\n【カレンダー予定】\n"
     for cal_id, events in events_by_cal.items():
-        text += f"Source: {cal_id}\n"
+        display_name = get_calendar_display_name(cal_id, calendar_names)
+        text += f"Source: {display_name}\n"
         for ev in events:
             start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
             summary = ev.get("summary", "タイトルなし")
@@ -298,6 +318,7 @@ def main():
 
     # 2. Googleカレンダーイベント取得
     events_by_cal = {}
+    calendar_names = {}  # カレンダー名を保持する辞書を追加
     for cal_id in CALENDAR_IDS:
         cid = cal_id.strip()
         if not cid:
@@ -305,8 +326,11 @@ def main():
         try:
             gcal = GoogleCalendarAPI(key_file_path=SERVICE_ACCOUNT_FILE, calendar_id=cid)
             cal_events = gcal.list_events(start_date, end_date)
+            calendar_name = gcal.get_calendar_name()  # カレンダー名を取得
             events_by_cal[cid] = cal_events
-            print(f"Calendar({cid}): {len(cal_events)}件")
+            calendar_names[cid] = calendar_name  # 名前を保存
+            display_name = get_calendar_display_name(cid, calendar_names)
+            print(f"Calendar({display_name}): {len(cal_events)}件")
         except Exception as e:
             print(f"Calendar({cid}) Skip: {e}")
 
@@ -315,7 +339,7 @@ def main():
         print("データが存在しないため終了します。")
         return
 
-    input_text = format_data_for_ai(done_tasks, events_by_cal)
+    input_text = format_data_for_ai(done_tasks, events_by_cal, calendar_names)
     print("Geminiによる分析を実行中...")
     ai_review_text = generate_review(input_text, period_str)
 
@@ -342,7 +366,7 @@ def main():
 
             # 4-2. ブロックリストの構築
             #  ① Googleカレンダー実績
-            cal_blocks = format_calendar_blocks(events_by_cal)
+            cal_blocks = format_calendar_blocks(events_by_cal, calendar_names)
             #  ② 完了タスク実績
             task_blocks = format_task_blocks(done_tasks)
             #  ③ AI振り返り
