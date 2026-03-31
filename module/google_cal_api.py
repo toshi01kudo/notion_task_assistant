@@ -151,3 +151,20 @@ class GoogleCalendarAPI:
         )
 
         return events_result.get("items", [])
+
+    def get_calendar_name(self) -> str:
+        """カレンダーの表示名を取得する。
+
+        Returns:
+            str: カレンダーの表示名。取得できない場合はカレンダーIDを返す。
+        """
+        try:
+            calendar = self.service.calendars().get(calendarId=self.calendar_id).execute()
+            return calendar.get("summary", self.calendar_id)
+        except Exception:
+            logging.warning(
+                "Failed to fetch calendar name for calendar_id=%s; falling back to calendar_id.",
+                self.calendar_id,
+                exc_info=True,
+            )
+            return self.calendar_id
