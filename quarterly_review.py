@@ -1,12 +1,14 @@
 import os
 import datetime
+import logging
 from collections import defaultdict
+from typing import Optional, Union
 from dateutil.relativedelta import relativedelta
 from google import genai
 from dotenv import load_dotenv
 
 # 既存モジュールのインポート
-from module.notion_api import TaskDB, ReviewDB
+from module.notion_api import TaskDB, ReviewDB, RelatedDB, BaseNotionDB
 from module.google_cal_api import GoogleCalendarAPI
 
 load_dotenv()
@@ -15,6 +17,8 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_TASK_ID = os.getenv("NOTION_TASK_ID")
+NOTION_PJ_ID = os.getenv("NOTION_PJ_ID")
+NOTION_SPRINT_ID = os.getenv("NOTION_SPRINT_ID")
 NOTION_REVIEW_DB_ID = os.getenv("NOTION_REVIEW_DATABASE_ID")
 # GoogleカレンダーID（カンマ区切りで複数指定可能）
 CALENDAR_IDS = os.getenv("GOOGLE_CALENDAR_IDS", "primary").split(",")
@@ -32,6 +36,25 @@ class DummyRelatedDB:
 
     def get_item_from_pd(self, *args, **kwargs):
         return None
+
+
+def build_project_id_to_title(project_db: Optional[BaseNotionDB]) -> dict:
+    """プロジェクトIDからタイトルへのマッピング辞書を構築します。
+
+    Args:
+        project_db: プロジェクトデータベースのインスタンス（RelatedDB等）。
+
+    Returns:
+        dict: プロジェクトIDをキー、タイトルを値とする辞書。
+              構築に失敗した場合は空の辞書を返す。
+    """
+    project_id_to_title = {}
+    if project_db and hasattr(project_db, "pd_items"):
+        try:
+            project_id_to_title = dict(zip(project_db.pd_items["id"], project_db.pd_items["title"]))
+        except (KeyError, AttributeError) as e:
+            logging.warning(f"Failed to create project ID to title mapping: {e}")
+    return project_id_to_title
 
 
 def get_target_quarter_range() -> tuple[datetime.date, datetime.date]:
@@ -159,25 +182,54 @@ def format_calendar_blocks(events_by_cal: dict, calendar_names: dict) -> list:
     return blocks
 
 
-def format_task_blocks(tasks: list) -> list:
+def format_task_blocks(tasks: list, project_db: Optional[BaseNotionDB] = None) -> list:
     """プロジェクトごとの完了タスクリストブロックを作成します。
 
     Notionのボードビューの代わりに、プロジェクト名を見出しとしたリスト形式で表現します。
 
     Args:
         tasks (list): Notionタスクオブジェクトのリスト。
+        project_db (Optional[BaseNotionDB]): プロジェクトデータベースのインスタンス。
+            Noneの場合、全てのプロジェクトが「未分類」として扱われる。
 
     Returns:
         list: Notionブロックオブジェクトのリスト。
     """
     blocks = [create_heading_2("✅ 完了タスク実績 (プロジェクト別)")]
 
+    # プロジェクトIDからタイトルへのマッピングを事前に作成（パフォーマンス改善）
+    project_id_to_title = build_project_id_to_title(project_db)
+
+    # マッピング構築失敗を検出（project_dbが渡されているのにマッピングが空）
+    mapping_failed = project_db is not None and not project_id_to_title
+    if mapping_failed:
+        logging.warning(
+            "Project DB was provided but project ID to title mapping is empty. Projects will show as unresolved."
+        )
+
     # プロジェクトごとに分類
     tasks_by_project = defaultdict(list)
+
     for task in tasks:
         props = task.get("properties", {})
-        project_obj = props.get("Project", {}).get("select") or props.get("プロジェクト", {}).get("select")
-        project_name = project_obj["name"] if project_obj else "未分類"
+        # relation型のプロジェクトプロパティから取得
+        project_relation = props.get("プロジェクト", {}).get("relation", [])
+
+        project_name = "未分類"
+        if project_relation and len(project_relation) > 0:
+            project_id = project_relation[0]["id"]
+            # キャッシュされたマッピングから取得
+            if project_id_to_title:
+                if project_id in project_id_to_title:
+                    project_name = project_id_to_title[project_id]
+                else:
+                    logging.warning(f"Project ID not found in mapping: {project_id}")
+                    # マッピングに存在しないIDは「未分類」と区別できる未解決プレースホルダにする
+                    project_name = f"未解決: {project_id[:8]}..."
+            elif mapping_failed:
+                # マッピング構築失敗時は、IDを含むプレースホルダ名を使用
+                project_name = f"未解決: {project_id[:8]}..."
+
         tasks_by_project[project_name].append(task)
 
     for project_name, task_list in tasks_by_project.items():
@@ -219,17 +271,27 @@ def format_ai_content_blocks(markdown_text: str) -> list:
 # --- Gemini関連処理 ---
 
 
-def format_data_for_ai(tasks: list, events_by_cal: dict, calendar_names: dict) -> str:
+def format_data_for_ai(
+    tasks: list, events_by_cal: dict, calendar_names: dict, project_db: Optional[BaseNotionDB] = None
+) -> str:
     """収集したタスクとイベントデータを、AIへのプロンプト用にテキスト整形します。
 
     Args:
         tasks (list): Notionから取得したタスクオブジェクト(辞書)のリスト。
         events_by_cal (dict): カレンダーごとのイベントリスト辞書。
         calendar_names (dict): カレンダーIDをキー、カレンダー名を値とする辞書。
+        project_db (Optional[BaseNotionDB]): プロジェクトデータベースのインスタンス。
+            Noneの場合、全てのプロジェクトが「未分類」として扱われる。
 
     Returns:
         str: AIへの入力として利用する整形済みテキスト文字列。
     """
+    # プロジェクトIDからタイトルへのマッピングを事前に作成（パフォーマンス改善）
+    project_id_to_title = build_project_id_to_title(project_db)
+
+    # マッピング構築失敗を検出（project_dbが渡されているのにマッピングが空）
+    mapping_failed = project_db is not None and not project_id_to_title
+
     text = "【完了タスク】\n"
     for task in tasks:
         props = task.get("properties", {})
@@ -237,9 +299,23 @@ def format_data_for_ai(tasks: list, events_by_cal: dict, calendar_names: dict) -
         title_list = props.get("Name", {}).get("title", []) or props.get("タスク名", {}).get("title", [])
         title = title_list[0]["plain_text"] if title_list else "無題"
 
-        # プロジェクトの取得
-        project_obj = props.get("Project", {}).get("select") or props.get("プロジェクト", {}).get("select")
-        project = project_obj["name"] if project_obj else "未分類"
+        # プロジェクトの取得（relation型から解決）
+        project_relation = props.get("プロジェクト", {}).get("relation", [])
+
+        project = "未分類"
+        if project_relation and len(project_relation) > 0:
+            project_id = project_relation[0]["id"]
+            # キャッシュされたマッピングから取得
+            if project_id_to_title:
+                if project_id in project_id_to_title:
+                    project = project_id_to_title[project_id]
+                else:
+                    logging.warning(f"Project ID not found in mapping: {project_id}")
+                    # マッピングに存在しないが relation がある場合は、未解決を明示
+                    project = f"未解決: {project_id[:8]}..."
+            elif mapping_failed:
+                # マッピング構築失敗時は、IDを含むプレースホルダ名を使用
+                project = f"未解決: {project_id[:8]}..."
 
         text += f"- {title} (Project: {project})\n"
 
@@ -293,6 +369,193 @@ def generate_review(text_data: str, period_str: str) -> str:
         return None
 
 
+def initialize_related_dbs() -> (
+    tuple[Union[BaseNotionDB, DummyRelatedDB], Union[BaseNotionDB, DummyRelatedDB], Optional[BaseNotionDB]]
+):
+    """プロジェクトDBとスプリントDBを初期化します。
+
+    Returns:
+        tuple: (project_db, sprint_db, project_db_for_format)
+            - project_db: TaskDBに渡すプロジェクトDBインスタンス
+            - sprint_db: TaskDBに渡すスプリントDBインスタンス
+            - project_db_for_format: format関数に渡すプロジェクトDB（ダミーの場合はNone）
+    """
+    project_db = DummyRelatedDB()
+    sprint_db = DummyRelatedDB()
+    project_db_for_format = None
+    project_db_init_success = False
+    sprint_db_init_success = False
+
+    if NOTION_PJ_ID:
+        try:
+            project_db = RelatedDB(db_id=NOTION_PJ_ID, token=NOTION_TOKEN)
+            # データ取得の成功を確認（必須カラムの存在と件数チェック）
+            if hasattr(project_db, "pd_items") and not project_db.pd_items.empty:
+                required_columns = {"id", "title"}
+                if required_columns.issubset(project_db.pd_items.columns):
+                    project_db_for_format = project_db
+                    project_db_init_success = True
+                    print(f"プロジェクトDB: {len(project_db.pd_items)}件取得")
+                else:
+                    logging.error(f"プロジェクトDBに必須カラム({required_columns})が不足しています")
+                    project_db = DummyRelatedDB()  # 検証失敗時はダミーに差し戻す
+            else:
+                logging.error("プロジェクトDBのデータ取得に失敗しました（pd_itemsが空）")
+                project_db = DummyRelatedDB()  # 検証失敗時はダミーに差し戻す
+        except Exception as e:
+            logging.error(f"プロジェクトDBの初期化に失敗しました: {e}")
+            project_db = DummyRelatedDB()
+
+    if NOTION_SPRINT_ID:
+        try:
+            sprint_db = RelatedDB(db_id=NOTION_SPRINT_ID, token=NOTION_TOKEN)
+            # データ取得の成功を確認
+            if hasattr(sprint_db, "pd_items") and not sprint_db.pd_items.empty:
+                required_columns = {"id", "title"}
+                if required_columns.issubset(sprint_db.pd_items.columns):
+                    sprint_db_init_success = True
+                    print(f"スプリントDB: {len(sprint_db.pd_items)}件取得")
+                else:
+                    logging.error(f"スプリントDBに必須カラム({required_columns})が不足しています")
+                    sprint_db = DummyRelatedDB()  # 検証失敗時はダミーに差し戻す
+            else:
+                logging.error("スプリントDBのデータ取得に失敗しました（pd_itemsが空）")
+                sprint_db = DummyRelatedDB()  # 検証失敗時はダミーに差し戻す
+        except Exception as e:
+            logging.error(f"スプリントDBの初期化に失敗しました: {e}")
+            sprint_db = DummyRelatedDB()
+
+    # 初期化結果をサマリー出力
+    if project_db_init_success and sprint_db_init_success:
+        print("✓ プロジェクトDBとスプリントDBを初期化しました")
+    elif project_db_init_success and not sprint_db_init_success:
+        print("警告: スプリントDBのIDが未設定または初期化に失敗しました。ダミーを使用します。")
+    elif sprint_db_init_success and not project_db_init_success:
+        print("警告: プロジェクトDBのIDが未設定または初期化に失敗しました。ダミーを使用します。")
+    else:
+        print("警告: プロジェクトDBおよびスプリントDBが未設定または初期化に失敗しました。両方ともダミーを使用します。")
+
+    return project_db, sprint_db, project_db_for_format
+
+
+def fetch_completed_tasks(
+    start_date: datetime.date,
+    end_date: datetime.date,
+    project_db: Union[BaseNotionDB, DummyRelatedDB],
+    sprint_db: Union[BaseNotionDB, DummyRelatedDB],
+) -> list:
+    """指定期間の完了タスクを取得します。
+
+    Args:
+        start_date: 期間開始日
+        end_date: 期間終了日
+        project_db: プロジェクトDBインスタンス
+        sprint_db: スプリントDBインスタンス
+
+    Returns:
+        list: 完了タスクのリスト
+    """
+    try:
+        # NOTE: TaskDBは初期化時に全件取得（_load_and_process_data）が走るが、
+        # このスクリプトではget_done_tasks()のクエリのみ使用するため、
+        # 将来的には初期ロードをスキップするオプションや軽量クラスの導入を検討。
+        tasks_db = TaskDB(
+            db_id=NOTION_TASK_ID, token=NOTION_TOKEN, related_dbs={"Projects": project_db, "Sprints": sprint_db}
+        )
+
+        # DataFrameを使わず、直接APIを叩くメソッドを使用
+        done_tasks = tasks_db.get_done_tasks(start_date.isoformat(), end_date.isoformat())
+        print(f"Notion完了タスク: {len(done_tasks)}件取得")
+        return done_tasks
+    except Exception as e:
+        print(f"TaskDB Init/Fetch Error: {e}")
+        return []
+
+
+def fetch_calendar_events(start_date: datetime.date, end_date: datetime.date) -> tuple[dict, dict]:
+    """指定期間のGoogleカレンダーイベントを取得します。
+
+    Args:
+        start_date: 期間開始日
+        end_date: 期間終了日
+
+    Returns:
+        tuple: (events_by_cal, calendar_names)
+            - events_by_cal: カレンダーIDをキー、イベントリストを値とする辞書
+            - calendar_names: カレンダーIDをキー、カレンダー名を値とする辞書
+    """
+    events_by_cal = {}
+    calendar_names = {}
+
+    for cal_id in CALENDAR_IDS:
+        cid = cal_id.strip()
+        if not cid:
+            continue
+        try:
+            gcal = GoogleCalendarAPI(key_file_path=SERVICE_ACCOUNT_FILE, calendar_id=cid)
+            cal_events = gcal.list_events(start_date, end_date)
+            calendar_name = gcal.get_calendar_name()
+            events_by_cal[cid] = cal_events
+            calendar_names[cid] = calendar_name
+            display_name = get_calendar_display_name(cid, calendar_names)
+            print(f"Calendar({display_name}): {len(cal_events)}件")
+        except Exception as e:
+            print(f"Calendar({cid}) Skip: {e}")
+
+    return events_by_cal, calendar_names
+
+
+def create_review_page(
+    period_str: str,
+    done_tasks: list,
+    events_by_cal: dict,
+    calendar_names: dict,
+    ai_review_text: str,
+    project_db_for_format: Optional[BaseNotionDB],
+) -> None:
+    """Notionに振り返りページを作成します。
+
+    Args:
+        period_str: 期間を表す文字列
+        done_tasks: 完了タスクのリスト
+        events_by_cal: カレンダーイベントの辞書
+        calendar_names: カレンダー名の辞書
+        ai_review_text: AI生成の振り返りテキスト
+        project_db_for_format: プロジェクトDBインスタンス
+    """
+    if not NOTION_REVIEW_DB_ID:
+        print("DB ID未設定のためスキップ")
+        return
+
+    try:
+        review_db = ReviewDB(db_id=NOTION_REVIEW_DB_ID, token=NOTION_TOKEN)
+
+        # まず空のページを作成 (タイトルのみ)
+        new_page = review_db.create_review_page(title=f"{period_str} 振り返りレポート", content="")
+
+        if not new_page:
+            print("ページ作成に失敗しました")
+            return
+
+        page_id = new_page["id"]
+        print(f"ページ作成成功 (ID: {page_id})。詳細ブロックを追加します...")
+
+        # ブロックリストの構築
+        cal_blocks = format_calendar_blocks(events_by_cal, calendar_names)
+        task_blocks = format_task_blocks(done_tasks, project_db_for_format)
+        ai_blocks = format_ai_content_blocks(ai_review_text)
+
+        # 全ブロックを結合
+        all_blocks = cal_blocks + task_blocks + ai_blocks
+
+        # ブロックを追加
+        review_db.append_children(page_id, all_blocks)
+        print("✅ 全ブロックの追加が完了しました！")
+
+    except Exception as e:
+        print(f"Notion Write Error: {e}")
+
+
 def main():
     """四半期ごとの振り返り生成プロセスのメイン実行関数。"""
     print("--- 四半期振り返り自動生成を開始します ---")
@@ -301,45 +564,21 @@ def main():
     period_str = f"{start_date.strftime('%Y-%m-%d')} 〜 {end_date.strftime('%Y-%m-%d')}"
     print(f"対象期間: {period_str}")
 
-    # 1. Notion完了タスク取得
-    done_tasks = []
-    try:
-        # TaskDBは初期化時にrelated_dbsを要求するため、ダミーを渡してエラーを回避
-        dummy_db = DummyRelatedDB()
-        tasks_db = TaskDB(
-            db_id=NOTION_TASK_ID, token=NOTION_TOKEN, related_dbs={"Projects": dummy_db, "Sprints": dummy_db}
-        )
+    # 1. プロジェクトDBとスプリントDBの初期化
+    project_db, sprint_db, project_db_for_format = initialize_related_dbs()
 
-        # DataFrameを使わず、直接APIを叩くメソッドを使用
-        done_tasks = tasks_db.get_done_tasks(start_date.isoformat(), end_date.isoformat())
-        print(f"Notion完了タスク: {len(done_tasks)}件取得")
-    except Exception as e:
-        print(f"TaskDB Init/Fetch Error: {e}")
+    # 2. Notion完了タスク取得
+    done_tasks = fetch_completed_tasks(start_date, end_date, project_db, sprint_db)
 
-    # 2. Googleカレンダーイベント取得
-    events_by_cal = {}
-    calendar_names = {}  # カレンダー名を保持する辞書を追加
-    for cal_id in CALENDAR_IDS:
-        cid = cal_id.strip()
-        if not cid:
-            continue
-        try:
-            gcal = GoogleCalendarAPI(key_file_path=SERVICE_ACCOUNT_FILE, calendar_id=cid)
-            cal_events = gcal.list_events(start_date, end_date)
-            calendar_name = gcal.get_calendar_name()  # カレンダー名を取得
-            events_by_cal[cid] = cal_events
-            calendar_names[cid] = calendar_name  # 名前を保存
-            display_name = get_calendar_display_name(cid, calendar_names)
-            print(f"Calendar({display_name}): {len(cal_events)}件")
-        except Exception as e:
-            print(f"Calendar({cid}) Skip: {e}")
+    # 3. Googleカレンダーイベント取得
+    events_by_cal, calendar_names = fetch_calendar_events(start_date, end_date)
 
-    # 3. Gemini分析
+    # 4. Gemini分析
     if not done_tasks and not events_by_cal:
         print("データが存在しないため終了します。")
         return
 
-    input_text = format_data_for_ai(done_tasks, events_by_cal, calendar_names)
+    input_text = format_data_for_ai(done_tasks, events_by_cal, calendar_names, project_db_for_format)
     print("Geminiによる分析を実行中...")
     ai_review_text = generate_review(input_text, period_str)
 
@@ -349,40 +588,8 @@ def main():
 
     print("\n--- 生成完了。Notionに書き込みます ---")
 
-    # 4. Notionページ作成とブロック追加
-    if NOTION_REVIEW_DB_ID:
-        try:
-            review_db = ReviewDB(db_id=NOTION_REVIEW_DB_ID, token=NOTION_TOKEN)
-
-            # 4-1. まず空のページを作成 (タイトルのみ)
-            new_page = review_db.create_review_page(title=f"{period_str} 振り返りレポート", content="")
-
-            if not new_page:
-                print("ページ作成に失敗しました")
-                return
-
-            page_id = new_page["id"]
-            print(f"ページ作成成功 (ID: {page_id})。詳細ブロックを追加します...")
-
-            # 4-2. ブロックリストの構築
-            #  ① Googleカレンダー実績
-            cal_blocks = format_calendar_blocks(events_by_cal, calendar_names)
-            #  ② 完了タスク実績
-            task_blocks = format_task_blocks(done_tasks)
-            #  ③ AI振り返り
-            ai_blocks = format_ai_content_blocks(ai_review_text)
-
-            # 全ブロックを結合
-            all_blocks = cal_blocks + task_blocks + ai_blocks
-
-            # 4-3. ブロックを追加 (append_childrenを使用)
-            review_db.append_children(page_id, all_blocks)
-            print("✅ 全ブロックの追加が完了しました！")
-
-        except Exception as e:
-            print(f"Notion Write Error: {e}")
-    else:
-        print("DB ID未設定のためスキップ")
+    # 5. Notionページ作成とブロック追加
+    create_review_page(period_str, done_tasks, events_by_cal, calendar_names, ai_review_text, project_db_for_format)
 
 
 if __name__ == "__main__":
